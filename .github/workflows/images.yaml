@@ -7,7 +7,6 @@ on:
       - 'README.md'
     branches:
       - main
-      - feature/governed-rag-no-openai
 
 jobs:
   build:
