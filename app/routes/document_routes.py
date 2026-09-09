@@ -20,12 +20,12 @@ from fastapi import (
     File,
     Form,
     Body,
+    Header,
     Query,
     status,
 )
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from functools import lru_cache
 
 if TYPE_CHECKING:
     from app.services.vector_store.async_pg_vector import AsyncPgVector
@@ -46,6 +46,26 @@ from app.config import (
     RAG_DISTANCE_THRESHOLD,
 )
 from app.scope import file_clause, files_clause, resolve_scope
+from app.constants import ERROR_MESSAGES
+from app.models import (
+    StoreDocument,
+    QueryRequestBody,
+    DocumentResponse,
+    QueryMultipleBody,
+)
+from app.services.vector_store.async_pg_vector import AsyncPgVector
+from app.services.secure_ai_embeddings import (
+    NORMALIZATION_VERSION,
+    SecureAIEmbeddingError,
+    SecureAIEmbeddings,
+)
+from app.utils.document_loader import (
+    get_loader,
+    clean_text,
+    process_documents,
+    cleanup_temp_encoding_file,
+)
+from app.utils.health import is_health_ok
 
 # Warn once at import time if the user set a threshold under Atlas, where
 # the score direction is inverted (Atlas vectorSearchScore: higher = better)
@@ -83,27 +103,52 @@ def _apply_distance_threshold(documents):
     return [(doc, score) for doc, score in documents if score <= RAG_DISTANCE_THRESHOLD]
 
 
-from app.constants import ERROR_MESSAGES
-from app.models import (
-    StoreDocument,
-    QueryRequestBody,
-    DocumentResponse,
-    QueryMultipleBody,
-)
-from app.services.vector_store.async_pg_vector import AsyncPgVector
-from app.utils.document_loader import (
-    get_loader,
-    clean_text,
-    process_documents,
-    cleanup_temp_encoding_file,
-)
-from app.utils.health import is_health_ok
-
 router = APIRouter()
 
 _INGESTION_ATTEMPT_ID_KEY = "_rag_ingestion_attempt_id"
 _INGESTION_ATTEMPT_STARTED_AT_NS_KEY = "_rag_ingestion_attempt_started_at_ns"
 _INGESTION_CHUNK_INDEX_KEY = "_rag_chunk_index"
+
+
+def _embedding_model_mismatch() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={
+            "code": "embedding_model_mismatch",
+            "message": "Re-embed this file under the selected gateway key.",
+        },
+    )
+
+
+async def _get_scoped_documents(
+    request: Request, file_ids: list[str], owners: list[str]
+) -> list[Document]:
+    if isinstance(vector_store, AsyncPgVector):
+        return await vector_store.get_documents_by_ids(
+            file_ids, owners=owners, executor=request.app.state.thread_pool
+        )
+    return vector_store.get_documents_by_ids(file_ids, owners=owners)
+
+
+def _validate_stored_fingerprint(
+    documents: list[Document],
+    embedder: SecureAIEmbeddings,
+    dimensions: int | None = None,
+) -> None:
+    expected = {
+        "provider": embedder.model.provider,
+        "model": embedder.model.model,
+        "normalization_version": NORMALIZATION_VERSION,
+    }
+    if not documents:
+        raise HTTPException(status_code=404, detail="No documents found")
+
+    for document in documents:
+        metadata = document.metadata or {}
+        if any(metadata.get(key) != value for key, value in expected.items()):
+            raise _embedding_model_mismatch()
+        if dimensions is not None and metadata.get("dimensions") != dimensions:
+            raise _embedding_model_mismatch()
 
 
 def _tag_documents_for_ingestion(documents: List[Document], file_id: str) -> str:
@@ -534,21 +579,25 @@ async def delete_documents(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# Cache the embedding function with LRU cache
-@lru_cache(maxsize=128)
-def get_cached_query_embedding(query: str):
-    return vector_store.embedding_function.embed_query(query)
-
-
 @router.post("/query")
 async def query_embeddings_by_file_id(
     body: QueryRequestBody,
     request: Request,
+    x_polygraf_gateway_key: str = Header(..., alias="X-Polygraf-Gateway-Key"),
 ):
     scope = resolve_scope(request, body.entity_id)
 
     try:
-        embedding = get_cached_query_embedding(body.query)
+        embedder = SecureAIEmbeddings(x_polygraf_gateway_key, body.embedding_model)
+        stored_documents = await _get_scoped_documents(
+            request, [body.file_id], scope.owners
+        )
+        _validate_stored_fingerprint(stored_documents, embedder)
+        loop = asyncio.get_running_loop()
+        embedding = await loop.run_in_executor(
+            request.app.state.thread_pool, embedder.embed_query, body.query
+        )
+        _validate_stored_fingerprint(stored_documents, embedder, len(embedding))
         query_filter = scope.predicate(file_clause(body.file_id))
 
         if isinstance(vector_store, AsyncPgVector):
@@ -565,7 +614,11 @@ async def query_embeddings_by_file_id(
 
         return _apply_distance_threshold(documents)
 
-    except HTTPException as http_exc:
+    except SecureAIEmbeddingError as error:
+        raise HTTPException(status_code=error.status_code, detail=str(error)) from error
+    except (ValueError, HTTPException) as http_exc:
+        if isinstance(http_exc, ValueError):
+            raise HTTPException(status_code=422, detail=str(http_exc)) from http_exc
         logger.error(
             "HTTP Exception in query_embeddings_by_file_id | Status: %d | Detail: %s",
             http_exc.status_code,
@@ -1085,9 +1138,99 @@ async def store_data_in_vector_db(
         return {"message": "An error occurred while adding documents.", "error": str(e)}
 
 
+async def store_governed_data_in_vector_db(
+    data: Iterable[Document],
+    file_id: str,
+    user_id: str,
+    embedder: SecureAIEmbeddings,
+    clean_content: bool = False,
+    executor=None,
+) -> dict:
+    loop = asyncio.get_running_loop()
+    documents = await loop.run_in_executor(
+        executor,
+        _prepare_documents_sync,
+        data,
+        file_id,
+        user_id,
+        clean_content,
+    )
+    if not documents:
+        return {"message": "Documents added successfully", "ids": []}
+
+    ingestion_attempt_id = _tag_documents_for_ingestion(documents, file_id)
+    batch_size = EMBEDDING_BATCH_SIZE if EMBEDDING_BATCH_SIZE > 0 else len(documents)
+    inserted_ids = []
+    dimensions = None
+    try:
+        for start in range(0, len(documents), batch_size):
+            batch = documents[start : start + batch_size]
+            vectors = await loop.run_in_executor(
+                executor,
+                embedder.embed_documents,
+                [document.page_content for document in batch],
+            )
+            batch_dimensions = len(vectors[0])
+            if dimensions is not None and batch_dimensions != dimensions:
+                raise SecureAIEmbeddingError(
+                    "Secure AI changed embedding dimensions during ingestion"
+                )
+            dimensions = batch_dimensions
+            fingerprint = embedder.fingerprint(dimensions)
+            for document in batch:
+                document.metadata = {**document.metadata, **fingerprint}
+
+            if isinstance(vector_store, AsyncPgVector):
+                batch_ids = await vector_store.aadd_documents_with_embeddings(
+                    batch,
+                    vectors,
+                    ids=[file_id] * len(batch),
+                    executor=executor,
+                )
+            elif hasattr(vector_store, "add_documents_with_embeddings"):
+                batch_ids = await loop.run_in_executor(
+                    executor,
+                    vector_store.add_documents_with_embeddings,
+                    batch,
+                    vectors,
+                )
+            else:
+                batch_ids = await loop.run_in_executor(
+                    executor,
+                    lambda: vector_store.add_embeddings(
+                        texts=[document.page_content for document in batch],
+                        embeddings=vectors,
+                        metadatas=[document.metadata for document in batch],
+                        ids=[file_id] * len(batch),
+                    ),
+                )
+            inserted_ids.extend(batch_ids)
+    except Exception:
+        if inserted_ids:
+            if isinstance(vector_store, AsyncPgVector):
+                await vector_store.delete_by_metadata(
+                    {
+                        "file_id": file_id,
+                        _INGESTION_ATTEMPT_ID_KEY: ingestion_attempt_id,
+                    },
+                    executor=executor,
+                )
+            else:
+                await loop.run_in_executor(
+                    executor,
+                    lambda: vector_store.delete_scoped(ids=[file_id], owners=[user_id]),
+                )
+        raise
+
+    return {"message": "Documents added successfully", "ids": inserted_ids}
+
+
 @router.post("/local/embed")
 async def embed_local_file(
-    document: StoreDocument, request: Request, entity_id: str = None
+    document: StoreDocument,
+    request: Request,
+    entity_id: str = None,
+    x_polygraf_gateway_key: str = Header(..., alias="X-Polygraf-Gateway-Key"),
 ):
     user_id = get_user_id(request, entity_id)
     file_path = validate_file_path(RAG_UPLOAD_DIR, document.filepath)
@@ -1127,16 +1270,14 @@ async def embed_local_file(
             request.app.state.thread_pool, lambda: list(loader.lazy_load())
         )
 
-        result = await store_data_in_vector_db(
-            data,
-            document.file_id,
-            user_id,
+        embedder = SecureAIEmbeddings(x_polygraf_gateway_key, document.embedding_model)
+        result = await store_governed_data_in_vector_db(
+            data=data,
+            file_id=document.file_id,
+            user_id=user_id,
+            embedder=embedder,
             clean_content=file_ext == "pdf",
             executor=request.app.state.thread_pool,
-            route_name="local_embed",
-            filename=document.filename,
-            content_type=document.file_content_type,
-            temp_file_path=file_path,
         )
 
         if result:
@@ -1151,7 +1292,11 @@ async def embed_local_file(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail=ERROR_MESSAGES.DEFAULT(),
             )
-    except HTTPException as http_exc:
+    except SecureAIEmbeddingError as error:
+        raise HTTPException(status_code=error.status_code, detail=str(error)) from error
+    except (ValueError, HTTPException) as http_exc:
+        if isinstance(http_exc, ValueError):
+            raise HTTPException(status_code=422, detail=str(http_exc)) from http_exc
         logger.error(
             "HTTP Exception in embed_local_file | route=local_embed | user_id=%s | file_id=%s | filename=%s | status=%d | detail=%s",
             user_id,
@@ -1192,6 +1337,8 @@ async def embed_file(
     file_id: str = Form(...),
     file: UploadFile = File(...),
     entity_id: str = Form(None),
+    embedding_model: str = Form(...),
+    x_polygraf_gateway_key: str = Header(..., alias="X-Polygraf-Gateway-Key"),
 ):
     response_status = True
     response_message = "File processed successfully."
@@ -1241,16 +1388,14 @@ async def embed_file(
             known_type,
         )
 
-        result = await store_data_in_vector_db(
+        embedder = SecureAIEmbeddings(x_polygraf_gateway_key, embedding_model)
+        result = await store_governed_data_in_vector_db(
             data=data,
             file_id=file_id,
             user_id=user_id,
+            embedder=embedder,
             clean_content=file_ext == "pdf",
             executor=request.app.state.thread_pool,
-            route_name="embed",
-            filename=file.filename,
-            content_type=file.content_type,
-            temp_file_path=validated_file_path,
         )
 
         if not result:
@@ -1270,7 +1415,11 @@ async def embed_file(
                     status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                     detail="An unspecified error occurred.",
                 )
-    except HTTPException as http_exc:
+    except SecureAIEmbeddingError as error:
+        raise HTTPException(status_code=error.status_code, detail=str(error)) from error
+    except (ValueError, HTTPException) as http_exc:
+        if isinstance(http_exc, ValueError):
+            raise HTTPException(status_code=422, detail=str(http_exc)) from http_exc
         response_status = False
         response_message = f"HTTP Exception: {http_exc.detail}"
         logger.error(
@@ -1365,6 +1514,8 @@ async def embed_file_upload(
     file_id: str = Form(...),
     uploaded_file: UploadFile = File(...),
     entity_id: str = Form(None),
+    embedding_model: str = Form(...),
+    x_polygraf_gateway_key: str = Header(..., alias="X-Polygraf-Gateway-Key"),
 ):
     user_id = get_user_id(request, entity_id)
 
@@ -1403,16 +1554,14 @@ async def embed_file_upload(
             request.app.state.thread_pool,
         )
 
-        result = await store_data_in_vector_db(
-            data,
-            file_id,
-            user_id,
+        embedder = SecureAIEmbeddings(x_polygraf_gateway_key, embedding_model)
+        result = await store_governed_data_in_vector_db(
+            data=data,
+            file_id=file_id,
+            user_id=user_id,
+            embedder=embedder,
             clean_content=file_ext == "pdf",
             executor=request.app.state.thread_pool,
-            route_name="embed_upload",
-            filename=uploaded_file.filename,
-            content_type=uploaded_file.content_type,
-            temp_file_path=validated_temp_file_path,
         )
 
         if not result:
@@ -1420,7 +1569,11 @@ async def embed_file_upload(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="Failed to process/store the file data.",
             )
-    except HTTPException as http_exc:
+    except SecureAIEmbeddingError as error:
+        raise HTTPException(status_code=error.status_code, detail=str(error)) from error
+    except (ValueError, HTTPException) as http_exc:
+        if isinstance(http_exc, ValueError):
+            raise HTTPException(status_code=422, detail=str(http_exc)) from http_exc
         logger.error(
             "HTTP Exception in embed_file_upload | route=embed_upload | user_id=%s | file_id=%s | filename=%s | status=%d | detail=%s",
             user_id,
@@ -1456,11 +1609,23 @@ async def embed_file_upload(
 
 
 @router.post("/query_multiple")
-async def query_embeddings_by_file_ids(request: Request, body: QueryMultipleBody):
+async def query_embeddings_by_file_ids(
+    request: Request,
+    body: QueryMultipleBody,
+    x_polygraf_gateway_key: str = Header(..., alias="X-Polygraf-Gateway-Key"),
+):
     scope = resolve_scope(request, body.entity_id)
     try:
-        # Get the embedding of the query text
-        embedding = get_cached_query_embedding(body.query)
+        embedder = SecureAIEmbeddings(x_polygraf_gateway_key, body.embedding_model)
+        stored_documents = await _get_scoped_documents(
+            request, body.file_ids, scope.owners
+        )
+        _validate_stored_fingerprint(stored_documents, embedder)
+        loop = asyncio.get_running_loop()
+        embedding = await loop.run_in_executor(
+            request.app.state.thread_pool, embedder.embed_query, body.query
+        )
+        _validate_stored_fingerprint(stored_documents, embedder, len(embedding))
         query_filter = scope.predicate(files_clause(body.file_ids))
 
         # Perform similarity search with the query embedding and filter by the file_ids in metadata
@@ -1485,7 +1650,11 @@ async def query_embeddings_by_file_ids(request: Request, body: QueryMultipleBody
             )
 
         return documents
-    except HTTPException as http_exc:
+    except SecureAIEmbeddingError as error:
+        raise HTTPException(status_code=error.status_code, detail=str(error)) from error
+    except (ValueError, HTTPException) as http_exc:
+        if isinstance(http_exc, ValueError):
+            raise HTTPException(status_code=422, detail=str(http_exc)) from http_exc
         logger.error(
             "HTTP Exception in query_embeddings_by_file_ids | Status: %d | Detail: %s",
             http_exc.status_code,

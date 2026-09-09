@@ -31,14 +31,15 @@ def override_vector_store(monkeypatch):
     from app.services.vector_store.async_pg_vector import AsyncPgVector
     from app.routes import document_routes
 
-    # Clear the LRU cache and patch the cached function to return dummy embeddings
-    document_routes.get_cached_query_embedding.cache_clear()
-
-    def dummy_get_cached_query_embedding(query):
-        return [0.1, 0.2, 0.3]
-
     monkeypatch.setattr(
-        document_routes, "get_cached_query_embedding", dummy_get_cached_query_embedding
+        document_routes.SecureAIEmbeddings,
+        "embed_query",
+        lambda self, query: [0.1, 0.2, 0.3],
+    )
+    monkeypatch.setattr(
+        document_routes.SecureAIEmbeddings,
+        "embed_documents",
+        lambda self, texts: [[0.1, 0.2, 0.3] for _ in texts],
     )
 
     # Initialize thread pool for tests since TestClient doesn't run lifespan
@@ -63,7 +64,16 @@ def override_vector_store(monkeypatch):
     # Override get_documents_by_ids as an async function.
     async def dummy_get_documents_by_ids(self, ids, owners=None, executor=None):
         return [
-            Document(page_content="Test content", metadata={"file_id": id})
+            Document(
+                page_content="Test content",
+                metadata={
+                    "file_id": id,
+                    "provider": "gemini",
+                    "model": "text-embedding-004",
+                    "dimensions": 3,
+                    "normalization_version": "none-v1",
+                },
+            )
             for id in ids
         ]
 
@@ -122,6 +132,17 @@ def override_vector_store(monkeypatch):
     monkeypatch.setattr(AsyncPgVector, "add_documents", dummy_add_documents)
     monkeypatch.setattr(AsyncPgVector, "aadd_documents", dummy_aadd_documents)
 
+    async def dummy_aadd_documents_with_embeddings(
+        self, docs, embeddings, ids=None, executor=None
+    ):
+        return ids
+
+    monkeypatch.setattr(
+        AsyncPgVector,
+        "aadd_documents_with_embeddings",
+        dummy_aadd_documents_with_embeddings,
+    )
+
     # Override delete function.
     async def dummy_delete(self, ids=None, collection_only=False, executor=None):
         return None
@@ -167,7 +188,9 @@ def test_query_embeddings_by_file_id(auth_headers):
         "file_id": "testid1",
         "k": 4,
         "entity_id": "testuser",
+        "embedding_model": "gemini/text-embedding-004",
     }
+    auth_headers["X-Polygraf-Gateway-Key"] = "pgk_live_fake_test"
     response = client.post("/query", json=data, headers=auth_headers)
     assert response.status_code == 200
     json_data = response.json()
@@ -175,6 +198,45 @@ def test_query_embeddings_by_file_id(auth_headers):
     if json_data:
         doc = json_data[0][0]
         assert doc["page_content"] == "Queried content"
+
+
+def test_query_embedding_model_mismatch_requires_reembedding(auth_headers, monkeypatch):
+    from app.services.vector_store.async_pg_vector import AsyncPgVector
+
+    async def mismatched_documents(self, ids, owners=None, executor=None):
+        return [
+            Document(
+                page_content="Test content",
+                metadata={
+                    "file_id": "testid1",
+                    "provider": "cohere",
+                    "model": "embed-v3",
+                    "dimensions": 3,
+                    "normalization_version": "none-v1",
+                },
+            )
+        ]
+
+    embed_query = pytest.fail
+    monkeypatch.setattr(AsyncPgVector, "get_documents_by_ids", mismatched_documents)
+    monkeypatch.setattr(
+        document_routes.SecureAIEmbeddings,
+        "embed_query",
+        lambda self, query: embed_query("query embedding must not run after mismatch"),
+    )
+    response = client.post(
+        "/query",
+        json={
+            "query": "Test query",
+            "file_id": "testid1",
+            "embedding_model": "gemini/text-embedding-004",
+        },
+        headers={**auth_headers, "X-Polygraf-Gateway-Key": "pgk_live_fake_test"},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "embedding_model_mismatch"
+    assert "Re-embed" in response.json()["detail"]["message"]
 
 
 def test_embed_local_file(tmp_path, auth_headers, monkeypatch):
@@ -190,7 +252,9 @@ def test_embed_local_file(tmp_path, auth_headers, monkeypatch):
         "filename": "test.txt",
         "file_content_type": "text/plain",
         "file_id": "testid1",
+        "embedding_model": "gemini/text-embedding-004",
     }
+    auth_headers["X-Polygraf-Gateway-Key"] = "pgk_live_fake_test"
     response = client.post("/local/embed", json=data, headers=auth_headers)
     assert response.status_code == 200, f"Response: {response.text}"
     json_data = response.json()
@@ -205,9 +269,13 @@ def test_embed_file(tmp_path, auth_headers):
     with test_file.open("rb") as f:
         response = client.post(
             "/embed",
-            data={"file_id": "testid1", "entity_id": "testuser"},
+            data={
+                "file_id": "testid1",
+                "entity_id": "testuser",
+                "embedding_model": "gemini/text-embedding-004",
+            },
             files={"file": ("test_embed.txt", f, "text/plain")},
-            headers=auth_headers,
+            headers={**auth_headers, "X-Polygraf-Gateway-Key": "pgk_live_fake_test"},
         )
     assert response.status_code == 200, f"Response: {response.text}"
     json_data = response.json()
@@ -300,9 +368,13 @@ def test_embed_file_upload(tmp_path, auth_headers, monkeypatch):
     with test_file.open("rb") as f:
         response = client.post(
             "/embed-upload",
-            data={"file_id": "testid1", "entity_id": "testuser"},
+            data={
+                "file_id": "testid1",
+                "entity_id": "testuser",
+                "embedding_model": "gemini/text-embedding-004",
+            },
             files={"uploaded_file": ("upload_test.txt", f, "text/plain")},
-            headers=auth_headers,
+            headers={**auth_headers, "X-Polygraf-Gateway-Key": "pgk_live_fake_test"},
         )
     assert response.status_code == 200, f"Response: {response.text}"
     json_data = response.json()
@@ -315,7 +387,9 @@ def test_query_multiple(auth_headers):
         "query": "Test query multiple",
         "file_ids": ["testid1", "testid2"],
         "k": 4,
+        "embedding_model": "gemini/text-embedding-004",
     }
+    auth_headers["X-Polygraf-Gateway-Key"] = "pgk_live_fake_test"
     response = client.post("/query_multiple", json=data, headers=auth_headers)
     assert response.status_code == 200, f"Response: {response.text}"
     json_data = response.json()
