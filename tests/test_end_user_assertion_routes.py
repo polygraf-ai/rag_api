@@ -78,7 +78,9 @@ def gateway(monkeypatch):
 
 @pytest.mark.parametrize("route", EMBEDDING_ROUTES)
 def test_assertion_reaches_the_gateway_once(route, auth, upload_dir, gateway, store, logs):
-    response = call(route, auth, upload_dir, [(HEADER, ASSERTION)])
+    response = call(
+        route, auth, upload_dir, [(HEADER, ASSERTION), ("X-Polygraf-Source-App", "direct_api")]
+    )
 
     assert response.status_code == 200, response.text
     assert len(gateway.calls) == 1
@@ -86,6 +88,7 @@ def test_assertion_reaches_the_gateway_once(route, auth, upload_dir, gateway, st
     assert sent["url"] == "http://secure-ai.test/v1/embeddings"
     assert sent["headers"] == {
         "Authorization": f"Bearer {GATEWAY_KEY}",
+        "X-Polygraf-Source-App": "secure_llm_document_search",
         HEADER: ASSERTION,
     }
     assert not sent["kwargs"].get("follow_redirects", False)
@@ -93,19 +96,22 @@ def test_assertion_reaches_the_gateway_once(route, auth, upload_dir, gateway, st
     assert_secret_absent(response, logs, ASSERTION)
 
 
-# --- R7: no header, no change -----------------------------------------------
+# --- R7: no assertion header forwarded --------------------------------------
 
 
 @pytest.mark.parametrize("route", EMBEDDING_ROUTES)
 @pytest.mark.parametrize("extra", [(), ((HEADER, "   "),)], ids=["absent", "blank"])
-def test_without_assertion_gateway_request_is_as_before(
+def test_without_assertion_gateway_request_omits_assertion_header(
     route, extra, auth, upload_dir, gateway, store
 ):
     response = call(route, auth, upload_dir, extra)
 
     assert response.status_code == 200, response.text
     assert len(gateway.calls) == 1
-    assert gateway.calls[0]["headers"] == {"Authorization": f"Bearer {GATEWAY_KEY}"}
+    assert gateway.calls[0]["headers"] == {
+        "Authorization": f"Bearer {GATEWAY_KEY}",
+        "X-Polygraf-Source-App": "secure_llm_document_search",
+    }
 
 
 # --- R3: the gateway's header rules, before any work ------------------------

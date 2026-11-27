@@ -194,6 +194,9 @@ logging.getLogger("uvicorn.access").disabled = True
 
 SECURE_AI_BASE_URL = get_env_variable("SECURE_AI_BASE_URL", required=True).rstrip("/")
 SECURE_AI_TIMEOUT_SECONDS = float(get_env_variable("SECURE_AI_TIMEOUT_SECONDS", "30"))
+SECURE_AI_SOURCE_APP = get_env_variable(
+    "SECURE_AI_SOURCE_APP", "secure_llm_document_search"
+)
 
 # Only parse RAG_DISTANCE_THRESHOLD when it will actually be applied (pgvector).
 # Under atlas-mongo the setting is documented as ignored, so parsing it
