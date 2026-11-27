@@ -163,6 +163,18 @@ The following environment variables are required to run the application:
   also send the exact dashboard assignment as `embedding_model=provider/model`.
   This service stores neither credential and has no provider key, model default,
   retry model, or direct-provider fallback.
+- Embedding routes (`/embed`, `/embed-upload`, `/local/embed`, `/query`,
+  `/query_multiple`) also accept an optional `X-Polygraf-End-User-Assertion`, the
+  short-lived dashboard-signed assertion for the signed-in user. It is passed only
+  on the gateway `/v1/embeddings` call of that same request, so usage is attributed
+  to that person; it is never stored or logged. Sent twice, longer than 4096 bytes,
+  or not printable ASCII, it is refused with 400 `invalid_end_user_assertion`
+  before any work. Without it, gateway calls are unchanged.
+- Gateway refusals keep their status (400/401/403/404/409/429; anything else is
+  502, a timeout 504) and answer `{"detail": {"code", "type", "message"}}`, where
+  `code` and `type` are the gateway's `error.code` / `error.type` (for example
+  `end_user_assertion_invalid`, `end_user_assertion_required`,
+  `gateway_key_revoked`) and `message` is this service's own text.
 - `VECTOR_DB_TYPE`: (Optional) select vector database type, default to `pgvector`.
 - `POSTGRES_USE_UNIX_SOCKET`: (Optional) Set to "True" when connecting to the PostgreSQL database server with Unix Socket.
 - `POSTGRES_DB`: (Optional) The name of the PostgreSQL database, used when `VECTOR_DB_TYPE=pgvector`.

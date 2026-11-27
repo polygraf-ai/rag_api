@@ -54,6 +54,7 @@ from app.models import (
     QueryMultipleBody,
 )
 from app.services.vector_store.async_pg_vector import AsyncPgVector
+from app.services.end_user_assertion import read_end_user_assertion
 from app.services.secure_ai_embeddings import (
     NORMALIZATION_VERSION,
     SecureAIEmbeddingError,
@@ -117,6 +118,20 @@ def _embedding_model_mismatch() -> HTTPException:
             "code": "embedding_model_mismatch",
             "message": "Re-embed this file under the selected gateway key.",
         },
+    )
+
+
+def _secure_ai_http_exception(error: SecureAIEmbeddingError) -> HTTPException:
+    """A failed gateway call as rag_api's answer.
+
+    Keeps the status and the gateway's ``error.code`` / ``error.type`` so
+    Secure LLM can tell an expired end-user assertion (renew and resend) from a
+    revoked key or a missing user. The message is rag_api's own fixed text,
+    never the gateway's.
+    """
+    return HTTPException(
+        status_code=error.status_code,
+        detail={"code": error.code, "type": error.error_type, "message": str(error)},
     )
 
 
@@ -585,10 +600,15 @@ async def query_embeddings_by_file_id(
     request: Request,
     x_polygraf_gateway_key: str = Header(..., alias="X-Polygraf-Gateway-Key"),
 ):
+    end_user_assertion = read_end_user_assertion(request)
     scope = resolve_scope(request, body.entity_id)
 
     try:
-        embedder = SecureAIEmbeddings(x_polygraf_gateway_key, body.embedding_model)
+        embedder = SecureAIEmbeddings(
+            x_polygraf_gateway_key,
+            body.embedding_model,
+            end_user_assertion=end_user_assertion,
+        )
         stored_documents = await _get_scoped_documents(
             request, [body.file_id], scope.owners
         )
@@ -615,7 +635,7 @@ async def query_embeddings_by_file_id(
         return _apply_distance_threshold(documents)
 
     except SecureAIEmbeddingError as error:
-        raise HTTPException(status_code=error.status_code, detail=str(error)) from error
+        raise _secure_ai_http_exception(error) from error
     except (ValueError, HTTPException) as http_exc:
         if isinstance(http_exc, ValueError):
             raise HTTPException(status_code=422, detail=str(http_exc)) from http_exc
@@ -1207,18 +1227,32 @@ async def store_governed_data_in_vector_db(
             inserted_ids.extend(batch_ids)
     except Exception:
         if inserted_ids:
-            if isinstance(vector_store, AsyncPgVector):
-                await vector_store.delete_by_metadata(
-                    {
-                        "file_id": file_id,
-                        _INGESTION_ATTEMPT_ID_KEY: ingestion_attempt_id,
-                    },
-                    executor=executor,
-                )
-            else:
-                await loop.run_in_executor(
-                    executor,
-                    lambda: vector_store.delete_scoped(ids=[file_id], owners=[user_id]),
+            try:
+                if isinstance(vector_store, AsyncPgVector):
+                    await vector_store.delete_by_metadata(
+                        {
+                            "file_id": file_id,
+                            _INGESTION_ATTEMPT_ID_KEY: ingestion_attempt_id,
+                        },
+                        executor=executor,
+                    )
+                else:
+                    await loop.run_in_executor(
+                        executor,
+                        lambda: vector_store.delete_scoped(
+                            ids=[file_id], owners=[user_id]
+                        ),
+                    )
+            except Exception as rollback_error:
+                # Re-raise the original failure, not this one: a gateway
+                # refusal (e.g. 401 end_user_assertion_invalid, which Secure
+                # LLM renews on) must keep its status and code.
+                logger.error(
+                    "Rollback of partial ingestion failed | file_id=%s | attempt_id=%s | rows=%d | error=%s",
+                    file_id,
+                    ingestion_attempt_id,
+                    len(inserted_ids),
+                    rollback_error,
                 )
         raise
 
@@ -1232,6 +1266,7 @@ async def embed_local_file(
     entity_id: str = None,
     x_polygraf_gateway_key: str = Header(..., alias="X-Polygraf-Gateway-Key"),
 ):
+    end_user_assertion = read_end_user_assertion(request)
     user_id = get_user_id(request, entity_id)
     file_path = validate_file_path(RAG_UPLOAD_DIR, document.filepath)
 
@@ -1270,7 +1305,11 @@ async def embed_local_file(
             request.app.state.thread_pool, lambda: list(loader.lazy_load())
         )
 
-        embedder = SecureAIEmbeddings(x_polygraf_gateway_key, document.embedding_model)
+        embedder = SecureAIEmbeddings(
+            x_polygraf_gateway_key,
+            document.embedding_model,
+            end_user_assertion=end_user_assertion,
+        )
         result = await store_governed_data_in_vector_db(
             data=data,
             file_id=document.file_id,
@@ -1293,7 +1332,7 @@ async def embed_local_file(
                 detail=ERROR_MESSAGES.DEFAULT(),
             )
     except SecureAIEmbeddingError as error:
-        raise HTTPException(status_code=error.status_code, detail=str(error)) from error
+        raise _secure_ai_http_exception(error) from error
     except (ValueError, HTTPException) as http_exc:
         if isinstance(http_exc, ValueError):
             raise HTTPException(status_code=422, detail=str(http_exc)) from http_exc
@@ -1344,6 +1383,7 @@ async def embed_file(
     response_message = "File processed successfully."
     known_type = None
 
+    end_user_assertion = read_end_user_assertion(request)
     user_id = get_user_id(request, entity_id)
     validated_file_path = _make_unique_temp_path(user_id, file.filename)
 
@@ -1388,7 +1428,11 @@ async def embed_file(
             known_type,
         )
 
-        embedder = SecureAIEmbeddings(x_polygraf_gateway_key, embedding_model)
+        embedder = SecureAIEmbeddings(
+            x_polygraf_gateway_key,
+            embedding_model,
+            end_user_assertion=end_user_assertion,
+        )
         result = await store_governed_data_in_vector_db(
             data=data,
             file_id=file_id,
@@ -1416,7 +1460,7 @@ async def embed_file(
                     detail="An unspecified error occurred.",
                 )
     except SecureAIEmbeddingError as error:
-        raise HTTPException(status_code=error.status_code, detail=str(error)) from error
+        raise _secure_ai_http_exception(error) from error
     except (ValueError, HTTPException) as http_exc:
         if isinstance(http_exc, ValueError):
             raise HTTPException(status_code=422, detail=str(http_exc)) from http_exc
@@ -1517,6 +1561,7 @@ async def embed_file_upload(
     embedding_model: str = Form(...),
     x_polygraf_gateway_key: str = Header(..., alias="X-Polygraf-Gateway-Key"),
 ):
+    end_user_assertion = read_end_user_assertion(request)
     user_id = get_user_id(request, entity_id)
 
     validated_temp_file_path = _make_unique_temp_path(user_id, uploaded_file.filename)
@@ -1554,7 +1599,11 @@ async def embed_file_upload(
             request.app.state.thread_pool,
         )
 
-        embedder = SecureAIEmbeddings(x_polygraf_gateway_key, embedding_model)
+        embedder = SecureAIEmbeddings(
+            x_polygraf_gateway_key,
+            embedding_model,
+            end_user_assertion=end_user_assertion,
+        )
         result = await store_governed_data_in_vector_db(
             data=data,
             file_id=file_id,
@@ -1570,7 +1619,7 @@ async def embed_file_upload(
                 detail="Failed to process/store the file data.",
             )
     except SecureAIEmbeddingError as error:
-        raise HTTPException(status_code=error.status_code, detail=str(error)) from error
+        raise _secure_ai_http_exception(error) from error
     except (ValueError, HTTPException) as http_exc:
         if isinstance(http_exc, ValueError):
             raise HTTPException(status_code=422, detail=str(http_exc)) from http_exc
@@ -1614,9 +1663,14 @@ async def query_embeddings_by_file_ids(
     body: QueryMultipleBody,
     x_polygraf_gateway_key: str = Header(..., alias="X-Polygraf-Gateway-Key"),
 ):
+    end_user_assertion = read_end_user_assertion(request)
     scope = resolve_scope(request, body.entity_id)
     try:
-        embedder = SecureAIEmbeddings(x_polygraf_gateway_key, body.embedding_model)
+        embedder = SecureAIEmbeddings(
+            x_polygraf_gateway_key,
+            body.embedding_model,
+            end_user_assertion=end_user_assertion,
+        )
         stored_documents = await _get_scoped_documents(
             request, body.file_ids, scope.owners
         )
@@ -1651,7 +1705,7 @@ async def query_embeddings_by_file_ids(
 
         return documents
     except SecureAIEmbeddingError as error:
-        raise HTTPException(status_code=error.status_code, detail=str(error)) from error
+        raise _secure_ai_http_exception(error) from error
     except (ValueError, HTTPException) as http_exc:
         if isinstance(http_exc, ValueError):
             raise HTTPException(status_code=422, detail=str(http_exc)) from http_exc
