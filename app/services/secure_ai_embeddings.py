@@ -1,11 +1,18 @@
+import re
 from dataclasses import dataclass
 
 import httpx
 from langchain_core.embeddings import Embeddings
 
 from app.config import SECURE_AI_BASE_URL, SECURE_AI_TIMEOUT_SECONDS
+from app.services.end_user_assertion import END_USER_ASSERTION_HEADER
 
 NORMALIZATION_VERSION = "none-v1"
+
+# Gateway refusals whose status rag_api passes on; anything else becomes 502.
+_RELAYED_STATUSES = (400, 401, 403, 404, 409, 429)
+# Shape of a gateway error.code / error.type that is safe to pass on.
+_SAFE_ERROR_TOKEN = re.compile(r"[a-z0-9_]{1,64}")
 
 
 def _embeddings_url() -> str:
@@ -15,9 +22,42 @@ def _embeddings_url() -> str:
 
 
 class SecureAIEmbeddingError(RuntimeError):
-    def __init__(self, message: str, status_code: int = 502):
+    """A failed gateway embedding call.
+
+    The message is always rag_api's own fixed text. ``code`` and ``error_type``
+    are the gateway's ``error.code`` / ``error.type`` when its refusal is relayed
+    with its own status and they are plain identifiers; otherwise None.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        status_code: int = 502,
+        code: str | None = None,
+        error_type: str | None = None,
+    ):
         super().__init__(message)
         self.status_code = status_code
+        self.code = code
+        self.error_type = error_type
+
+
+def _safe_token(value: object) -> str | None:
+    if isinstance(value, str) and _SAFE_ERROR_TOKEN.fullmatch(value):
+        return value
+    return None
+
+
+def _gateway_error_fields(response: httpx.Response) -> tuple[str | None, str | None]:
+    """The gateway's ``error.code`` and ``error.type``, never its message."""
+    try:
+        body = response.json()
+    except ValueError:
+        return None, None
+    error = body.get("error") if isinstance(body, dict) else None
+    if not isinstance(error, dict):
+        return None, None
+    return _safe_token(error.get("code")), _safe_token(error.get("type"))
 
 
 @dataclass(frozen=True)
@@ -39,20 +79,35 @@ def parse_embedding_model(value: str) -> EmbeddingModel:
 
 
 class SecureAIEmbeddings(Embeddings):
-    def __init__(self, gateway_key: str, embedding_model: str):
+    def __init__(
+        self,
+        gateway_key: str,
+        embedding_model: str,
+        end_user_assertion: str | None = None,
+    ):
         if not gateway_key.strip():
             raise ValueError("X-Polygraf-Gateway-Key is required")
         self._gateway_key = gateway_key
+        # Passed explicitly by the route that received it, never read from
+        # request-global state: run_in_executor does not carry contextvars into
+        # the worker thread. Sent only on the gateway /v1/embeddings call below.
+        self._end_user_assertion = end_user_assertion or None
         self.model = parse_embedding_model(embedding_model)
 
     def _embed(self, texts: list[str]) -> list[list[float]]:
         if not texts:
             return []
 
+        headers = {"Authorization": f"Bearer {self._gateway_key}"}
+        if self._end_user_assertion:
+            headers[END_USER_ASSERTION_HEADER] = self._end_user_assertion
+
         try:
+            # Redirects stay off (httpx's default): on a cross-origin redirect
+            # httpx drops Authorization but would forward the assertion.
             response = httpx.post(
                 _embeddings_url(),
-                headers={"Authorization": f"Bearer {self._gateway_key}"},
+                headers=headers,
                 json={"model": self.model.qualified_name, "input": texts},
                 timeout=SECURE_AI_TIMEOUT_SECONDS,
             )
@@ -64,14 +119,15 @@ class SecureAIEmbeddings(Embeddings):
             raise SecureAIEmbeddingError("Secure AI embedding request failed") from exc
 
         if not response.is_success:
-            status_code = (
-                response.status_code
-                if response.status_code in (400, 401, 403, 404, 409, 429)
-                else 502
+            relayed = response.status_code in _RELAYED_STATUSES
+            code, error_type = (
+                _gateway_error_fields(response) if relayed else (None, None)
             )
             raise SecureAIEmbeddingError(
                 f"Secure AI rejected the embedding request with status {response.status_code}",
-                status_code,
+                response.status_code if relayed else 502,
+                code=code,
+                error_type=error_type,
             )
 
         try:

@@ -9,6 +9,7 @@ from dotenv import find_dotenv, load_dotenv
 from starlette.middleware.base import BaseHTTPMiddleware
 from langchain_core.embeddings import Embeddings
 
+from app.services.end_user_assertion import EndUserAssertionRedactingFilter
 from app.services.vector_store.factory import get_vector_store
 
 load_dotenv(find_dotenv())
@@ -138,7 +139,10 @@ if console_json:
                 json_record[HTTP_RES] = record.__dict__[HTTP_RES]
 
             if record.levelno == logging.ERROR and record.exc_info:
-                json_record["exception"] = self.formatException(record.exc_info)
+                # exc_text is what the redacting filter already scrubbed.
+                json_record["exception"] = record.exc_text or self.formatException(
+                    record.exc_info
+                )
 
             timestamp = datetime.fromtimestamp(record.created)
             json_record["timestamp"] = timestamp.isoformat()
@@ -161,6 +165,8 @@ else:
 
 handler = logging.StreamHandler()  # or logging.FileHandler("app.log")
 handler.setFormatter(formatter)
+# Second line of defence: end-user assertions must never reach a log line.
+handler.addFilter(EndUserAssertionRedactingFilter())
 logger.addHandler(handler)
 
 

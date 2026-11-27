@@ -94,12 +94,27 @@ if debug_mode:
     app.include_router(router=pgvector_routes.router)
 
 
+def _without_header_inputs(errors):
+    """Validation errors minus the rejected value of any header.
+
+    Headers carry credentials (gateway key, end-user assertion); a 422 must not
+    echo them into the response or the debug log.
+    """
+    return [
+        {key: value for key, value in error.items() if key != "input"}
+        if tuple(error.get("loc", ()))[:1] == ("header",)
+        else error
+        for error in errors
+    ]
+
+
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    logger.debug("Validation error: %s", exc.errors())
+    errors = _without_header_inputs(exc.errors())
+    logger.debug("Validation error: %s", errors)
     return JSONResponse(
         status_code=422,
-        content={"detail": exc.errors(), "message": "Request validation failed"},
+        content={"detail": errors, "message": "Request validation failed"},
     )
 
 
