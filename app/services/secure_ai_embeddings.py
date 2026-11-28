@@ -4,7 +4,11 @@ from dataclasses import dataclass
 import httpx
 from langchain_core.embeddings import Embeddings
 
-from app.config import SECURE_AI_BASE_URL, SECURE_AI_TIMEOUT_SECONDS
+from app.config import (
+    SECURE_AI_BASE_URL,
+    SECURE_AI_SOURCE_APP,
+    SECURE_AI_TIMEOUT_SECONDS,
+)
 from app.services.end_user_assertion import END_USER_ASSERTION_HEADER
 
 NORMALIZATION_VERSION = "none-v1"
@@ -98,18 +102,21 @@ class SecureAIEmbeddings(Embeddings):
         if not texts:
             return []
 
-        headers = {"Authorization": f"Bearer {self._gateway_key}"}
+        headers = {
+            "Authorization": f"Bearer {self._gateway_key}",
+            "X-Polygraf-Source-App": SECURE_AI_SOURCE_APP,
+        }
         if self._end_user_assertion:
             headers[END_USER_ASSERTION_HEADER] = self._end_user_assertion
 
         try:
-            # Redirects stay off (httpx's default): on a cross-origin redirect
-            # httpx drops Authorization but would forward the assertion.
+            # Keep the assertion and source app on the gateway origin.
             response = httpx.post(
                 _embeddings_url(),
                 headers=headers,
                 json={"model": self.model.qualified_name, "input": texts},
                 timeout=SECURE_AI_TIMEOUT_SECONDS,
+                follow_redirects=False,
             )
         except httpx.TimeoutException as exc:
             raise SecureAIEmbeddingError(

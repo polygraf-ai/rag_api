@@ -152,7 +152,7 @@ docker compose build --no-cache
 
 ### Environment Variables
 
-The following environment variables are required to run the application:
+Use these environment variables to configure the application.
 
 - `SECURE_AI_BASE_URL`: Base URL of the Secure AI gateway. Every index and query
   embedding is sent to its OpenAI-compatible `/v1/embeddings` endpoint.
