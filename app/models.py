@@ -24,11 +24,13 @@ class StoreDocument(BaseModel):
     filename: str
     file_content_type: str
     file_id: str
+    embedding_model: str
 
 
 class QueryRequestBody(BaseModel):
     query: str
     file_id: str
+    embedding_model: str
     k: int = 4
     entity_id: Optional[str] = None
 
@@ -41,5 +43,6 @@ class CleanupMethod(str, Enum):
 class QueryMultipleBody(BaseModel):
     query: str
     file_ids: List[str]
+    embedding_model: str
     k: int = 4
     entity_id: Optional[str] = None

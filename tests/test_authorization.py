@@ -27,6 +27,13 @@ AGENT = "agent-abc"
 VICTIM_FILE = "file-victim"
 ATTACKER_FILE = "file-attacker"
 AGENT_FILE = "file-agent"
+EMBEDDING_MODEL = "gemini/text-embedding-004"
+EMBEDDING_FINGERPRINT = {
+    "provider": "gemini",
+    "model": "text-embedding-004",
+    "dimensions": 3,
+    "normalization_version": "none-v1",
+}
 
 client = TestClient(app)
 
@@ -39,7 +46,8 @@ def _token(user_id: str) -> dict:
         + datetime.timedelta(hours=1),
     }
     return {
-        "Authorization": f"Bearer {jwt.encode(payload, JWT_SECRET, algorithm='HS256')}"
+        "Authorization": f"Bearer {jwt.encode(payload, JWT_SECRET, algorithm='HS256')}",
+        "X-Polygraf-Gateway-Key": "pgk_live_authorization_test",
     }
 
 
@@ -97,9 +105,10 @@ def _matching(query_filter: dict) -> list:
 @pytest.fixture(autouse=True)
 def store_double(monkeypatch):
     """Patch AsyncPgVector so every read honours the predicate it is given."""
-    document_routes.get_cached_query_embedding.cache_clear()
     monkeypatch.setattr(
-        document_routes, "get_cached_query_embedding", lambda query: [0.1, 0.2, 0.3]
+        document_routes.SecureAIEmbeddings,
+        "embed_query",
+        lambda self, query: [0.1, 0.2, 0.3],
     )
 
     if getattr(app.state, "thread_pool", None) is None:
@@ -123,7 +132,11 @@ def store_double(monkeypatch):
         return [
             Document(
                 page_content=row["text"],
-                metadata={"file_id": row["file_id"], "user_id": row["user_id"]},
+                metadata={
+                    "file_id": row["file_id"],
+                    "user_id": row["user_id"],
+                    **EMBEDDING_FINGERPRINT,
+                },
             )
             for row in ROWS
             if row["user_id"] in owners and row["file_id"] in ids
@@ -141,7 +154,11 @@ def store_double(monkeypatch):
             (
                 Document(
                     page_content=row["text"],
-                    metadata={"file_id": row["file_id"], "user_id": row["user_id"]},
+                    metadata={
+                        "file_id": row["file_id"],
+                        "user_id": row["user_id"],
+                        **EMBEDDING_FINGERPRINT,
+                    },
                 ),
                 0.1,
             )
@@ -183,6 +200,7 @@ def test_query_multiple_no_longer_returns_foreign_files(attacker_headers):
             "query": "anything",
             "file_ids": [VICTIM_FILE, ATTACKER_FILE, AGENT_FILE],
             "k": 10,
+            "embedding_model": EMBEDDING_MODEL,
         },
         headers=attacker_headers,
     )
@@ -203,7 +221,12 @@ def test_query_authorizes_every_hit_not_just_the_first(attacker_headers):
     """
     response = client.post(
         "/query",
-        json={"query": "anything", "file_id": SHARED_FILE, "k": 10},
+        json={
+            "query": "anything",
+            "file_id": SHARED_FILE,
+            "k": 10,
+            "embedding_model": EMBEDDING_MODEL,
+        },
         headers=attacker_headers,
     )
 
@@ -217,12 +240,16 @@ def test_query_without_entity_id_cannot_reach_another_owner(attacker_headers):
     a victim's file id returns nothing rather than the victim's chunks."""
     response = client.post(
         "/query",
-        json={"query": "anything", "file_id": VICTIM_FILE, "k": 10},
+        json={
+            "query": "anything",
+            "file_id": VICTIM_FILE,
+            "k": 10,
+            "embedding_model": EMBEDDING_MODEL,
+        },
         headers=attacker_headers,
     )
 
-    assert response.status_code == 200
-    assert response.json() == []
+    assert response.status_code == 404
 
 
 def test_entity_id_is_still_caller_asserted(attacker_headers):
@@ -245,6 +272,7 @@ def test_entity_id_is_still_caller_asserted(attacker_headers):
             "file_id": VICTIM_FILE,
             "k": 10,
             "entity_id": VICTIM,
+            "embedding_model": EMBEDDING_MODEL,
         },
         headers=attacker_headers,
     )
@@ -268,6 +296,7 @@ def test_query_reaches_an_agent_knowledge_base(attacker_headers):
             "file_id": AGENT_FILE,
             "k": 10,
             "entity_id": AGENT,
+            "embedding_model": EMBEDDING_MODEL,
         },
         headers=attacker_headers,
     )
@@ -394,7 +423,13 @@ def test_unauthenticated_deployment_keeps_reading_its_own_chunks(monkeypatch):
     try:
         response = client.post(
             "/query",
-            json={"query": "anything", "file_id": public_file, "k": 10},
+            json={
+                "query": "anything",
+                "file_id": public_file,
+                "k": 10,
+                "embedding_model": EMBEDDING_MODEL,
+            },
+            headers={"X-Polygraf-Gateway-Key": "pgk_live_authorization_test"},
         )
 
         assert response.status_code == 200

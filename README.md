@@ -152,13 +152,29 @@ docker compose build --no-cache
 
 ### Environment Variables
 
-The following environment variables are required to run the application:
+Use these environment variables to configure the application.
 
-- `RAG_OPENAI_API_KEY`: The API key for OpenAI API Embeddings (if using default settings).
-    - Note: `OPENAI_API_KEY` will work but `RAG_OPENAI_API_KEY` will override it in order to not conflict with LibreChat setting.
-- `RAG_OPENAI_BASEURL`: (Optional) The base URL for your OpenAI API Embeddings
-- `RAG_OPENAI_PROXY`: (Optional) Proxy for OpenAI API Embeddings
-    - Note: When using with LibreChat, you can also set `HTTP_PROXY` and `HTTPS_PROXY` environment variables in the `docker-compose.override.yml` file (see [Proxy Configuration](#proxy-configuration) section below)
+- `SECURE_AI_BASE_URL`: Base URL of the Secure AI gateway. Every index and query
+  embedding is sent to its OpenAI-compatible `/v1/embeddings` endpoint.
+- `SECURE_AI_TIMEOUT_SECONDS`: (Optional) Secure AI request timeout. Defaults to `30`.
+- Embedding routes require two independent request credentials: the RAG JWT remains
+  in `Authorization` for document tenancy, while the dashboard-issued gateway key is
+  supplied in `X-Polygraf-Gateway-Key` for governed provider access. The caller must
+  also send the exact dashboard assignment as `embedding_model=provider/model`.
+  This service stores neither credential and has no provider key, model default,
+  retry model, or direct-provider fallback.
+- Embedding routes (`/embed`, `/embed-upload`, `/local/embed`, `/query`,
+  `/query_multiple`) also accept an optional `X-Polygraf-End-User-Assertion`, the
+  short-lived dashboard-signed assertion for the signed-in user. It is passed only
+  on the gateway `/v1/embeddings` call of that same request, so usage is attributed
+  to that person; it is never stored or logged. Sent twice, longer than 4096 bytes,
+  or not printable ASCII, it is refused with 400 `invalid_end_user_assertion`
+  before any work. Without it, gateway calls are unchanged.
+- Gateway refusals keep their status (400/401/403/404/409/429; anything else is
+  502, a timeout 504) and answer `{"detail": {"code", "type", "message"}}`, where
+  `code` and `type` are the gateway's `error.code` / `error.type` (for example
+  `end_user_assertion_invalid`, `end_user_assertion_required`,
+  `gateway_key_revoked`) and `message` is this service's own text.
 - `VECTOR_DB_TYPE`: (Optional) select vector database type, default to `pgvector`.
 - `POSTGRES_USE_UNIX_SOCKET`: (Optional) Set to "True" when connecting to the PostgreSQL database server with Unix Socket.
 - `POSTGRES_DB`: (Optional) The name of the PostgreSQL database, used when `VECTOR_DB_TYPE=pgvector`.
@@ -191,38 +207,8 @@ The following environment variables are required to run the application:
 - `DEBUG_RAG_API`: (Optional) Set to "True" to show more verbose logging output in the server console, and to enable postgresql database routes
 - `DEBUG_PGVECTOR_QUERIES`: (Optional) Set to "True" to enable detailed PostgreSQL query logging for pgvector operations. Useful for debugging performance issues with vector database queries.
 - `CONSOLE_JSON`: (Optional) Set to "True" to log as json for Cloud Logging aggregations
-- `EMBEDDINGS_PROVIDER`: (Optional) either "openai", "bedrock", "azure", "huggingface", "huggingfacetei", "google_genai", "vertexai", or "ollama", where "huggingface" uses sentence_transformers; defaults to "openai"
-- `EMBEDDINGS_MODEL`: (Optional) Set a valid embeddings model to use from the configured provider.
-    - **Defaults**
-    - openai: "text-embedding-3-small"
-    - azure: "text-embedding-3-small" (will be used as your Azure Deployment)
-    - huggingface: "sentence-transformers/all-MiniLM-L6-v2"
-    - huggingfacetei: "http://huggingfacetei:3000". Hugging Face TEI uses model defined on TEI service launch.
-    - vertexai: "gemini-embedding-001"
-    - ollama: "nomic-embed-text"
-    - bedrock: "amazon.titan-embed-text-v1"
-    - google_genai: "gemini-embedding-001"
-- `EMBEDDINGS_CHUNK_SIZE`: (Optional) The chunk size used by the OpenAI and Azure embeddings clients to limit the number of inputs per request. Default value is `200`.
-- `EMBEDDINGS_DIMENSIONS`: (Optional) Output vector size to request from the embedding model. Only honored by the `openai` and `azure` providers, and only supported by `text-embedding-3-*` models. Leave unset to use the model's native dimensionality (1536 for `text-embedding-3-small`, 3072 for `text-embedding-3-large`). Setting a smaller value (e.g. `512`, `1024`) trades some retrieval quality for lower storage cost and faster similarity search. Note: do not change this on an existing collection — all vectors in a `pgvector` column must share the same dimensionality.
-- `RAG_AZURE_OPENAI_API_VERSION`: (Optional) Default is `2023-05-15`. The version of the Azure OpenAI API.
-- `RAG_AZURE_OPENAI_API_KEY`: (Optional) The API key for Azure OpenAI service.
-    - Note: `AZURE_OPENAI_API_KEY` will work but `RAG_AZURE_OPENAI_API_KEY` will override it in order to not conflict with LibreChat setting.
-- `RAG_AZURE_OPENAI_ENDPOINT`: (Optional) The endpoint URL for Azure OpenAI service, including the resource.
-    - Example: `https://YOUR_RESOURCE_NAME.openai.azure.com`.
-    - Note: `AZURE_OPENAI_ENDPOINT` will work but `RAG_AZURE_OPENAI_ENDPOINT` will override it in order to not conflict with LibreChat setting.
-- `HF_TOKEN`: (Optional) if needed for `huggingface` option.
-- `OLLAMA_BASE_URL`: (Optional) defaults to `http://ollama:11434`.
 - `ATLAS_SEARCH_INDEX`: (Optional) the name of the vector search index if using Atlas MongoDB, defaults to `vector_index`
 - `MONGO_VECTOR_COLLECTION`: Deprecated for MongoDB, please use `ATLAS_SEARCH_INDEX` and `COLLECTION_NAME`
-- `AWS_DEFAULT_REGION`: (Optional) defaults to `us-east-1`
-- `AWS_ACCESS_KEY_ID`: (Optional) needed for bedrock embeddings
-- `AWS_SECRET_ACCESS_KEY`: (Optional) needed for bedrock embeddings
-- `GOOGLE_API_KEY`, `GOOGLE_KEY`, `RAG_GOOGLE_API_KEY`: (Optional) Google API key for Google GenAI embeddings. Priority order: RAG_GOOGLE_API_KEY > GOOGLE_KEY > GOOGLE_API_KEY
-- `AWS_SESSION_TOKEN`: (Optional) may be needed for bedrock embeddings
-- `GOOGLE_APPLICATION_CREDENTIALS`: (Optional) needed for Google VertexAI embeddings. This should be a path to a service account credential file in JSON format.
-- `GOOGLE_CLOUD_PROJECT`: (Optional) Google Cloud project ID, needed for VertexAI embeddings.
-- `GOOGLE_CLOUD_LOCATION`: (Optional) Google Cloud region for VertexAI embeddings. Defaults to `us-central1`.
-- `RAG_CHECK_EMBEDDING_CTX_LENGTH` (Optional) Default is true, disabling this will send raw input to the embedder, use this for custom embedding models.
 
 Make sure to set these environment variables before running the application. You can set them in a `.env` file or as system environment variables.
 

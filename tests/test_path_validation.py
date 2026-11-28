@@ -9,11 +9,17 @@ These tests are designed to catch regressions — if any test here fails,
 the CVE fix is broken.
 """
 
+import datetime
 import os
-import pytest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import jwt
+import pytest
+from fastapi.testclient import TestClient
+
 from app.routes.document_routes import validate_file_path
+from main import app
 
 
 # ---------------------------------------------------------------------------
@@ -220,14 +226,6 @@ class TestValidateFilePathValidInputs:
 # Integration tests: endpoint-level path traversal via TestClient
 # ---------------------------------------------------------------------------
 
-import datetime
-import jwt
-from fastapi.testclient import TestClient
-from unittest.mock import patch, AsyncMock
-from concurrent.futures import ThreadPoolExecutor
-
-from main import app
-
 client = TestClient(app)
 
 
@@ -241,7 +239,10 @@ def auth_headers():
         + datetime.timedelta(hours=1),
     }
     token = jwt.encode(payload, jwt_secret, algorithm="HS256")
-    return {"Authorization": f"Bearer {token}"}
+    return {
+        "Authorization": f"Bearer {token}",
+        "X-Polygraf-Gateway-Key": "pgk_live_path_test",
+    }
 
 
 @pytest.fixture(autouse=True)
@@ -271,6 +272,7 @@ class TestLocalEmbedPathTraversal:
             "filename": "evil.txt",
             "file_content_type": "text/plain",
             "file_id": "testid1",
+            "embedding_model": "gemini/text-embedding-004",
         }
         response = client.post("/local/embed", json=data, headers=auth_headers)
         # Should get 404 (file not found) or 400 (invalid) — NOT 200
@@ -297,7 +299,11 @@ class TestEntityIdPathTraversal:
         with test_file.open("rb") as f:
             response = client.post(
                 "/embed",
-                data={"file_id": "testid1", "entity_id": entity_id},
+                data={
+                    "file_id": "testid1",
+                    "entity_id": entity_id,
+                    "embedding_model": "gemini/text-embedding-004",
+                },
                 files={"file": ("safe.txt", f, "text/plain")},
                 headers=auth_headers,
             )
@@ -347,7 +353,11 @@ class TestEmbedPathTraversal:
         with test_file.open("rb") as f:
             response = client.post(
                 "/embed",
-                data={"file_id": "testid1", "entity_id": "testuser"},
+                data={
+                    "file_id": "testid1",
+                    "entity_id": "testuser",
+                    "embedding_model": "gemini/text-embedding-004",
+                },
                 files={"file": (filename, f, "text/plain")},
                 headers=auth_headers,
             )
@@ -374,7 +384,11 @@ class TestEmbedUploadPathTraversal:
         with test_file.open("rb") as f:
             response = client.post(
                 "/embed-upload",
-                data={"file_id": "testid1", "entity_id": "testuser"},
+                data={
+                    "file_id": "testid1",
+                    "entity_id": "testuser",
+                    "embedding_model": "gemini/text-embedding-004",
+                },
                 files={"uploaded_file": (filename, f, "text/plain")},
                 headers=auth_headers,
             )

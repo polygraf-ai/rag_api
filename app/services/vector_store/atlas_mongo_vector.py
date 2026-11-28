@@ -29,6 +29,33 @@ class AtlasMongoVector(MongoDBAtlasVectorSearch):
         ]
         return super().add_documents(documents, f_ids)
 
+    def add_documents_with_embeddings(
+        self,
+        documents: List[Document],
+        embeddings: List[List[float]],
+        ids: Optional[List[str]] = None,
+    ) -> List[str]:
+        if not documents:
+            return []
+        file_id = documents[0].metadata["file_id"]
+        document_ids = [
+            f"{file_id}_{document.metadata.get('digest') or hashlib.md5(document.page_content.encode()).hexdigest()}"
+            for document in documents
+        ]
+        records = [
+            {
+                "_id": document_id,
+                self._text_key: document.page_content,
+                self._embedding_key: embedding,
+                **document.metadata,
+            }
+            for document_id, document, embedding in zip(
+                document_ids, documents, embeddings, strict=True
+            )
+        ]
+        self._collection.insert_many(records)
+        return document_ids
+
     def similarity_search_with_score_by_vector(
         self,
         embedding: List[float],

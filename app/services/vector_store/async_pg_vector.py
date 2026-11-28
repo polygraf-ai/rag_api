@@ -117,3 +117,20 @@ class AsyncPgVector(ExtendedPgVector):
         return await self._run_in_executor(
             executor, super().add_documents, documents, ids=ids, **kwargs
         )
+
+    async def aadd_documents_with_embeddings(
+        self,
+        documents: List[Document],
+        embeddings: List[List[float]],
+        ids: Optional[List[str]] = None,
+        executor=None,
+    ) -> List[str]:
+        executor = executor or self._get_thread_pool()
+        return await self._run_in_executor(
+            executor,
+            super().add_embeddings,
+            texts=[document.page_content for document in documents],
+            embeddings=embeddings,
+            metadatas=[document.metadata for document in documents],
+            ids=ids,
+        )

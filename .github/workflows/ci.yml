@@ -34,13 +34,13 @@ jobs:
 
       - name: Run unit tests
         env:
-          OPENAI_API_KEY: test_key
+          SECURE_AI_BASE_URL: http://secure-ai.test
         run: |
           pytest --maxfail=1 --disable-warnings --junitxml=test-results-unit.xml
 
       - name: Run integration tests (pgvector container)
         env:
-          OPENAI_API_KEY: test_key
+          SECURE_AI_BASE_URL: http://secure-ai.test
         run: |
           pytest -m integration --maxfail=3 --disable-warnings --junitxml=test-results-integration.xml
 

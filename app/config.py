@@ -1,14 +1,15 @@
 # app/config.py
 import os
 import json
-import boto3
 import logging
 import urllib.parse
 from enum import Enum
 from datetime import datetime
 from dotenv import find_dotenv, load_dotenv
 from starlette.middleware.base import BaseHTTPMiddleware
+from langchain_core.embeddings import Embeddings
 
+from app.services.end_user_assertion import EndUserAssertionRedactingFilter
 from app.services.vector_store.factory import get_vector_store
 
 load_dotenv(find_dotenv())
@@ -17,17 +18,6 @@ load_dotenv(find_dotenv())
 class VectorDBType(Enum):
     PGVECTOR = "pgvector"
     ATLAS_MONGO = "atlas-mongo"
-
-
-class EmbeddingsProvider(Enum):
-    OPENAI = "openai"
-    AZURE = "azure"
-    HUGGINGFACE = "huggingface"
-    HUGGINGFACETEI = "huggingfacetei"
-    OLLAMA = "ollama"
-    BEDROCK = "bedrock"
-    GOOGLE_GENAI = "google_genai"
-    GOOGLE_VERTEXAI = "vertexai"
 
 
 def get_env_variable(
@@ -149,7 +139,10 @@ if console_json:
                 json_record[HTTP_RES] = record.__dict__[HTTP_RES]
 
             if record.levelno == logging.ERROR and record.exc_info:
-                json_record["exception"] = self.formatException(record.exc_info)
+                # exc_text is what the redacting filter already scrubbed.
+                json_record["exception"] = record.exc_text or self.formatException(
+                    record.exc_info
+                )
 
             timestamp = datetime.fromtimestamp(record.created)
             json_record["timestamp"] = timestamp.isoformat()
@@ -172,6 +165,8 @@ else:
 
 handler = logging.StreamHandler()  # or logging.FileHandler("app.log")
 handler.setFormatter(formatter)
+# Second line of defence: end-user assertions must never reach a log line.
+handler.addFilter(EndUserAssertionRedactingFilter())
 logger.addHandler(handler)
 
 
@@ -197,32 +192,9 @@ class LogMiddleware(BaseHTTPMiddleware):
 
 logging.getLogger("uvicorn.access").disabled = True
 
-## Credentials
-
-OPENAI_API_KEY = get_env_variable("OPENAI_API_KEY", "")
-RAG_OPENAI_API_KEY = get_env_variable("RAG_OPENAI_API_KEY", OPENAI_API_KEY)
-RAG_OPENAI_BASEURL = get_env_variable("RAG_OPENAI_BASEURL", None)
-RAG_OPENAI_PROXY = get_env_variable("RAG_OPENAI_PROXY", None)
-AZURE_OPENAI_API_KEY = get_env_variable("AZURE_OPENAI_API_KEY", "")
-RAG_AZURE_OPENAI_API_VERSION = get_env_variable("RAG_AZURE_OPENAI_API_VERSION", None)
-RAG_AZURE_OPENAI_API_KEY = get_env_variable(
-    "RAG_AZURE_OPENAI_API_KEY", AZURE_OPENAI_API_KEY
-)
-AZURE_OPENAI_ENDPOINT = get_env_variable("AZURE_OPENAI_ENDPOINT", "")
-RAG_AZURE_OPENAI_ENDPOINT = get_env_variable(
-    "RAG_AZURE_OPENAI_ENDPOINT", AZURE_OPENAI_ENDPOINT
-).rstrip("/")
-HF_TOKEN = get_env_variable("HF_TOKEN", "")
-OLLAMA_BASE_URL = get_env_variable("OLLAMA_BASE_URL", "http://ollama:11434")
-AWS_ACCESS_KEY_ID = get_env_variable("AWS_ACCESS_KEY_ID", "")
-AWS_SECRET_ACCESS_KEY = get_env_variable("AWS_SECRET_ACCESS_KEY", "")
-GOOGLE_API_KEY = get_env_variable("GOOGLE_API_KEY", "")
-GOOGLE_KEY = get_env_variable("GOOGLE_KEY", GOOGLE_API_KEY)
-RAG_GOOGLE_API_KEY = get_env_variable("RAG_GOOGLE_API_KEY", GOOGLE_KEY)
-AWS_SESSION_TOKEN = get_env_variable("AWS_SESSION_TOKEN", "")
-GOOGLE_APPLICATION_CREDENTIALS = get_env_variable("GOOGLE_APPLICATION_CREDENTIALS", "")
-env_value = get_env_variable("RAG_CHECK_EMBEDDING_CTX_LENGTH", "True").lower()
-RAG_CHECK_EMBEDDING_CTX_LENGTH = True if env_value == "true" else False
+SECURE_AI_BASE_URL = get_env_variable("SECURE_AI_BASE_URL", required=True).rstrip("/")
+SECURE_AI_TIMEOUT_SECONDS = float(get_env_variable("SECURE_AI_TIMEOUT_SECONDS", "30"))
+SECURE_AI_SOURCE_APP = "secure_llm_document_search"
 
 # Only parse RAG_DISTANCE_THRESHOLD when it will actually be applied (pgvector).
 # Under atlas-mongo the setting is documented as ignored, so parsing it
@@ -234,142 +206,16 @@ if VECTOR_DB_TYPE == VectorDBType.PGVECTOR:
     if _distance_threshold_raw not in (None, ""):
         RAG_DISTANCE_THRESHOLD = float(_distance_threshold_raw)
 
-## Embeddings
+
+class RequestScopedEmbeddings(Embeddings):
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        raise RuntimeError("Embedding access must be supplied by the current request")
+
+    def embed_query(self, text: str) -> list[float]:
+        raise RuntimeError("Embedding access must be supplied by the current request")
 
 
-def init_embeddings(provider, model, dimensions=None):
-    if provider == EmbeddingsProvider.OPENAI:
-        from langchain_openai import OpenAIEmbeddings
-
-        kwargs = dict(
-            model=model,
-            api_key=RAG_OPENAI_API_KEY,
-            openai_api_base=RAG_OPENAI_BASEURL,
-            openai_proxy=RAG_OPENAI_PROXY,
-            chunk_size=EMBEDDINGS_CHUNK_SIZE,
-            check_embedding_ctx_length=RAG_CHECK_EMBEDDING_CTX_LENGTH,
-        )
-        if dimensions is not None:
-            kwargs["dimensions"] = dimensions
-        return OpenAIEmbeddings(**kwargs)
-    elif provider == EmbeddingsProvider.AZURE:
-        from langchain_openai import AzureOpenAIEmbeddings
-
-        kwargs = dict(
-            azure_deployment=model,
-            api_key=RAG_AZURE_OPENAI_API_KEY,
-            azure_endpoint=RAG_AZURE_OPENAI_ENDPOINT,
-            api_version=RAG_AZURE_OPENAI_API_VERSION,
-            chunk_size=EMBEDDINGS_CHUNK_SIZE,
-            check_embedding_ctx_length=RAG_CHECK_EMBEDDING_CTX_LENGTH,
-        )
-        if dimensions is not None:
-            kwargs["dimensions"] = dimensions
-        return AzureOpenAIEmbeddings(**kwargs)
-    elif provider == EmbeddingsProvider.HUGGINGFACE:
-        from langchain_huggingface import HuggingFaceEmbeddings
-
-        return HuggingFaceEmbeddings(
-            model_name=model, encode_kwargs={"normalize_embeddings": True}
-        )
-    elif provider == EmbeddingsProvider.HUGGINGFACETEI:
-        from langchain_huggingface import HuggingFaceEndpointEmbeddings
-
-        return HuggingFaceEndpointEmbeddings(model=model)
-    elif provider == EmbeddingsProvider.OLLAMA:
-        from langchain_ollama import OllamaEmbeddings
-
-        return OllamaEmbeddings(model=model, base_url=OLLAMA_BASE_URL)
-    elif provider == EmbeddingsProvider.GOOGLE_GENAI:
-        from langchain_google_genai import GoogleGenerativeAIEmbeddings
-
-        return GoogleGenerativeAIEmbeddings(
-            model=model,
-            google_api_key=RAG_GOOGLE_API_KEY or None,
-        )
-    elif provider == EmbeddingsProvider.GOOGLE_VERTEXAI:
-        from langchain_google_genai import GoogleGenerativeAIEmbeddings
-
-        return GoogleGenerativeAIEmbeddings(
-            model=model,
-            google_api_key=RAG_GOOGLE_API_KEY or None,
-            vertexai=True,
-            project=get_env_variable("GOOGLE_CLOUD_PROJECT", None),
-            location=get_env_variable("GOOGLE_CLOUD_LOCATION", "us-central1"),
-        )
-    elif provider == EmbeddingsProvider.BEDROCK:
-        from langchain_aws import BedrockEmbeddings
-
-        session_kwargs = {
-            "aws_access_key_id": AWS_ACCESS_KEY_ID,
-            "aws_secret_access_key": AWS_SECRET_ACCESS_KEY,
-            "region_name": AWS_DEFAULT_REGION,
-        }
-
-        if AWS_SESSION_TOKEN:
-            session_kwargs["aws_session_token"] = AWS_SESSION_TOKEN
-
-        session = boto3.Session(**session_kwargs)
-        return BedrockEmbeddings(
-            client=session.client("bedrock-runtime"),
-            model_id=model,
-            region_name=AWS_DEFAULT_REGION,
-        )
-    else:
-        raise ValueError(f"Unsupported embeddings provider: {provider}")
-
-
-EMBEDDINGS_PROVIDER = EmbeddingsProvider(
-    get_env_variable("EMBEDDINGS_PROVIDER", EmbeddingsProvider.OPENAI.value).lower()
-)
-
-# Only parse EMBEDDINGS_DIMENSIONS for providers that honor it (OpenAI / Azure).
-# Parsing unconditionally at import would turn an unrelated stale env var
-# (e.g. EMBEDDINGS_DIMENSIONS=foo left over from an OpenAI deployment) into a
-# hard boot failure under bedrock / hf / ollama / etc., even though those
-# providers silently ignore the value.
-EMBEDDINGS_DIMENSIONS = None
-
-if EMBEDDINGS_PROVIDER in (EmbeddingsProvider.OPENAI, EmbeddingsProvider.AZURE):
-    _embeddings_dimensions_raw = get_env_variable("EMBEDDINGS_DIMENSIONS", None)
-    if _embeddings_dimensions_raw not in (None, ""):
-        EMBEDDINGS_DIMENSIONS = int(_embeddings_dimensions_raw)
-
-if EMBEDDINGS_PROVIDER == EmbeddingsProvider.OPENAI:
-    EMBEDDINGS_MODEL = get_env_variable("EMBEDDINGS_MODEL", "text-embedding-3-small")
-    # 1000 is the default chunk size for OpenAI, but this causes API rate limits to be hit
-    EMBEDDINGS_CHUNK_SIZE = get_env_variable("EMBEDDINGS_CHUNK_SIZE", 200)
-elif EMBEDDINGS_PROVIDER == EmbeddingsProvider.AZURE:
-    EMBEDDINGS_MODEL = get_env_variable("EMBEDDINGS_MODEL", "text-embedding-3-small")
-    # 2048 is the default (and maximum) chunk size for Azure, but this often causes unexpected 429 errors
-    EMBEDDINGS_CHUNK_SIZE = get_env_variable("EMBEDDINGS_CHUNK_SIZE", 200)
-elif EMBEDDINGS_PROVIDER == EmbeddingsProvider.HUGGINGFACE:
-    EMBEDDINGS_MODEL = get_env_variable(
-        "EMBEDDINGS_MODEL", "sentence-transformers/all-MiniLM-L6-v2"
-    )
-elif EMBEDDINGS_PROVIDER == EmbeddingsProvider.HUGGINGFACETEI:
-    EMBEDDINGS_MODEL = get_env_variable(
-        "EMBEDDINGS_MODEL", "http://huggingfacetei:3000"
-    )
-elif EMBEDDINGS_PROVIDER == EmbeddingsProvider.GOOGLE_VERTEXAI:
-    EMBEDDINGS_MODEL = get_env_variable("EMBEDDINGS_MODEL", "gemini-embedding-001")
-elif EMBEDDINGS_PROVIDER == EmbeddingsProvider.OLLAMA:
-    EMBEDDINGS_MODEL = get_env_variable("EMBEDDINGS_MODEL", "nomic-embed-text")
-elif EMBEDDINGS_PROVIDER == EmbeddingsProvider.GOOGLE_GENAI:
-    EMBEDDINGS_MODEL = get_env_variable("EMBEDDINGS_MODEL", "gemini-embedding-001")
-elif EMBEDDINGS_PROVIDER == EmbeddingsProvider.BEDROCK:
-    EMBEDDINGS_MODEL = get_env_variable(
-        "EMBEDDINGS_MODEL", "amazon.titan-embed-text-v1"
-    )
-    AWS_DEFAULT_REGION = get_env_variable("AWS_DEFAULT_REGION", "us-east-1")
-else:
-    raise ValueError(f"Unsupported embeddings provider: {EMBEDDINGS_PROVIDER}")
-
-embeddings = init_embeddings(
-    EMBEDDINGS_PROVIDER, EMBEDDINGS_MODEL, dimensions=EMBEDDINGS_DIMENSIONS
-)
-
-logger.info(f"Initialized embeddings of type: {type(embeddings)}")
+embeddings = RequestScopedEmbeddings()
 
 # Vector store
 if VECTOR_DB_TYPE == VectorDBType.PGVECTOR:
@@ -387,7 +233,7 @@ elif VECTOR_DB_TYPE == VectorDBType.ATLAS_MONGO:
     # Backward compatability check
     if MONGO_VECTOR_COLLECTION:
         logger.info(
-            f"DEPRECATED: Please remove env var MONGO_VECTOR_COLLECTION and instead use COLLECTION_NAME and ATLAS_SEARCH_INDEX. You can set both as same, but not neccessary. See README for more information."
+            "DEPRECATED: Please remove env var MONGO_VECTOR_COLLECTION and instead use COLLECTION_NAME and ATLAS_SEARCH_INDEX. You can set both as same, but not neccessary. See README for more information."
         )
         ATLAS_SEARCH_INDEX = MONGO_VECTOR_COLLECTION
         COLLECTION_NAME = MONGO_VECTOR_COLLECTION
