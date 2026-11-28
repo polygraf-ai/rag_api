@@ -13,7 +13,7 @@ from app.services.secure_ai_embeddings import (
 
 
 # secure-llm#81
-def test_secure_llm_81_upload_sends_default_source_app_with_gateway_key_and_model(monkeypatch):
+def test_secure_llm_81_upload_sends_source_app_with_gateway_key_and_model(monkeypatch):
     response = Mock(
         is_success=True,
         json=Mock(
@@ -116,7 +116,7 @@ def _refusal(status_code: int, body=None, json_error: Exception | None = None) -
 
 
 # secure-llm#81
-def test_secure_llm_81_query_sends_default_source_app(monkeypatch):
+def test_secure_llm_81_query_sends_source_app(monkeypatch):
     post = Mock(return_value=_ok_response())
     monkeypatch.setattr(secure_ai_embeddings.httpx, "post", post)
 
@@ -126,23 +126,6 @@ def test_secure_llm_81_query_sends_default_source_app(monkeypatch):
     assert (
         post.call_args.kwargs["headers"].get("X-Polygraf-Source-App")
         == "secure_llm_document_search"
-    )
-
-
-# secure-llm#81
-def test_secure_llm_81_uses_configured_source_app(monkeypatch):
-    monkeypatch.setattr(
-        secure_ai_embeddings, "SECURE_AI_SOURCE_APP", "custom_document_search", raising=False
-    )
-    post = Mock(return_value=_ok_response())
-    monkeypatch.setattr(secure_ai_embeddings.httpx, "post", post)
-
-    SecureAIEmbeddings("pgk_live_fake_test", "gemini/embed").embed_query("query")
-
-    post.assert_called_once()
-    assert (
-        post.call_args.kwargs["headers"].get("X-Polygraf-Source-App")
-        == "custom_document_search"
     )
 
 

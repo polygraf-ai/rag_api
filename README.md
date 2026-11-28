@@ -157,8 +157,6 @@ Use these environment variables to configure the application.
 - `SECURE_AI_BASE_URL`: Base URL of the Secure AI gateway. Every index and query
   embedding is sent to its OpenAI-compatible `/v1/embeddings` endpoint.
 - `SECURE_AI_TIMEOUT_SECONDS`: (Optional) Secure AI request timeout. Defaults to `30`.
-- `SECURE_AI_SOURCE_APP` (optional) sets the `X-Polygraf-Source-App` header on
-  gateway embedding requests. Defaults to `secure_llm_document_search`.
 - Embedding routes require two independent request credentials: the RAG JWT remains
   in `Authorization` for document tenancy, while the dashboard-issued gateway key is
   supplied in `X-Polygraf-Gateway-Key` for governed provider access. The caller must
